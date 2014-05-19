@@ -83,11 +83,14 @@ fn main() {
 	let templates: Vec<Template> = processInheritance(&mut templatesPre);
 
 	//Load content
-	let content: Vec<Page> = loadContent(contentFiles, &vars, &internalLinks, &includes);
+	let mut content: Vec<Page> = loadContent(contentFiles, &vars, &internalLinks, &includes);
 
-	//Process content
+	//Process content. Make block content and page content become HTML from Markdown.
+	let processedContent: Vec<Page> = processContent(&mut content);
 
-	//Generate content
+	//Generate content. Build full HTML by combining templates, blocks, and HTML content. 
+	//Then output to /html, making directory if it doesn't exist. 
+	//Copy all files from /resources to /html/resources. 
 }
 
 fn loadResourceNames(resourceFiles: Vec<Path>) -> Vec<~str> {
@@ -366,12 +369,35 @@ struct Page {
 	title: ~str,
 	template: ~str,
 	blocks: Vec<Block>,
+	headData: Vec<~str>,
 	content: ~str
+}
+
+impl Clone for Page {
+	fn clone(&self) -> Page {
+		let myPage = Page {
+			path: self.path.clone(),
+			linkName: self.linkName.clone(),
+			title: self.title.clone(),
+			template: self.template.clone(),
+			blocks: self.blocks.clone(),
+			headData: self.headData.clone(),
+			content: self.content.clone()
+		};
+		return myPage;
+	}
 }
 
 struct Block {
 	name: ~str,
 	content: Vec<(~str,~str)> //Vector of tuples: (variable, content)
+}
+
+impl Clone for Block {
+	fn clone(&self) -> Block {
+		let myBlock = Block { name: self.name.clone(), content: self.content.clone() };
+		return myBlock;
+	}
 }
 
 enum ContentStep {
@@ -382,12 +408,134 @@ enum ContentStep {
 	CInContent
 }
 
-//This one's a work in progress.
 fn loadContent(contentFiles: Vec<Path>, vars: &Vec<(~str,~str)>, internalLinks: &Vec<(~str,~str)>, includes: &Vec<(~str,~str)>) -> Vec<Page> {
 	let mut pages: Vec<Page> = Vec::new();
 	for file in contentFiles.iter() {
-		let mut myPage = Page {path: "".to_owned(), linkName: "".to_owned(), title: "".to_owned(), template: "".to_owned(), blocks: Vec::new(), content: "".to_owned()};
+		let mut myPage = Page {path: "".to_owned(), linkName: "".to_owned(), title: "".to_owned(), template: "".to_owned(), blocks: Vec::new(), headData: Vec::new(), content: "".to_owned()};
+		let mut fileReader = BufferedReader::new(File::open(file));
+		let mut curLine = fileReader.read_line().unwrap().trim().to_owned();
+		let mut curBlock = Block { name: "".to_owned(), content: Vec::new() };
+		let mut curBlockPart = "".to_owned();
+		let mut curBlockPartContent = "".to_owned();
+		let mut myStep: ContentStep = CInConfig;
+		loop {
+			let nextLine = fileReader.read_line();
+			match nextLine {
+				Ok(tex) => { curLine = tex.to_owned() },
+				Err(_) => { break }
+			}
+			let mut advanced = false;
+			match curLine.trim() {
+				"css" => {
+					myStep = CInCSS;
+					advanced = true;
+				},
+				"js" => {
+					myStep = CInJS;
+					advanced = true;
+				},
+				"blocks" => {
+					myStep = CInBlocks;
+					advanced = true;
+				},
+				"" => {
+					advanced = true; //Either we advance or this line is blank so ignore it regardless
+					match myStep {
+						CInBlocks => { myStep = CInContent; advanced = true; },
+						_ => { }
+					}
+				},
+				_ => { }
+			}
+			if !advanced {
+				let curLineUnTrimmed = curLine.to_owned();
+				curLine = curLine.trim().to_owned();
+				//Replace variables/links/includes if we might need to.
+				if curLine.contains_char('{') && curLine.contains_char('}') {
+					//Check if there are variables/links and replace them.
+					if curLine.contains("{$") || curLine.contains("{%") {
+						curLine = replaceVars(curLine, vars, internalLinks);
+					}
+					//Check if there are includes and insert them.
+					if curLine.contains("{.") {
+						curLine = insertIncludes(curLine, includes);
+					}
+				}
+				match myStep {
+					CInConfig => {
+						let mut splitString = curLine.split_str(":");
+						match splitString.next().unwrap() {
+							"path" => {
+								myPage.path = splitString.last().unwrap().to_owned();
+							},
+							"linkName" => {
+								myPage.linkName = splitString.last().unwrap().to_owned();
+							},
+							"title" => {
+								myPage.title = splitString.last().unwrap().to_owned();
+							},
+							"template" => {
+								myPage.template = splitString.last().unwrap().to_owned();
+							}
+							_ => { }
+						}
+					}, 
+					CInCSS => {
+						myPage.headData.push("<link rel='stylesheet' type='text/css' href='resources/css/" + curLine + "'>");
+					},
+					CInJS => {
+						myPage.headData.push("<script type='text/javascript' src='resources/js/" + curLine + "'></script>");
+					},
+					CInBlocks => {
+						//Support double tab or 8 spaces. This is not very flexible. 
+						if curLineUnTrimmed.starts_with("\t\t\t") || curLineUnTrimmed.starts_with("            ") {
+							//In a part
+							curBlockPartContent = curBlockPartContent + "\n" + curLine;
+						}
+						else if curLineUnTrimmed.starts_with("\t\t") || curLineUnTrimmed.starts_with("        ") {
+							//Found a new part
+							if curBlockPart != "".to_owned() && curBlockPartContent != "".to_owned() {
+								curBlock.content.push((curBlockPart.to_owned(), curBlockPartContent.to_owned()));
+							}
+							else if curBlockPart != "".to_owned() {
+								//If the current block implements the default part. 
+								//This restricts default parts to being a single line. If you want more then name it.
+								curBlock.content.push((curBlockPartContent.to_owned(), curBlockPart.to_owned()));
+							}
+							else {
+								curBlockPart = curLine;
+							}
+						}
+						else {
+							//Found a new block
+							let curBlockClone = curBlock.clone();
+							myPage.blocks.push(curBlockClone);
+							curBlock = Block { name: "".to_owned(), content: Vec::new() };
+							curBlockPart = "".to_owned();
+							curBlockPartContent = "".to_owned();
+						}
+					},
+					CInContent => {
+						myPage.content = curLine;
+						match fileReader.read_to_str() {
+							Ok(tex) => {
+								myPage.content = myPage.content + "\n" + tex;
+							},
+							Err(_) => {}
+						}
+					}
+				}
+			}
+		}
 	}
 	return pages;
+}
+
+fn processContent(pages: &mut Vec<Page>) -> Vec<Page> {
+	//Do things here
+
+	//Now return
+	let mut returnPages = pages.clone();
+	return returnPages;
 }
 
