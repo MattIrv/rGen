@@ -1,17 +1,18 @@
-use std::io::{BufferedReader, File, fs};
+use std::io::{BufferedReader, BufferedWriter, File, fs};
+use std::io;
 use std::os;
 use std::str;
 
 fn main() {
 	//Ensure that the user gave the correct command line argument. 
 	if !(os::args().len() >= 2) {
-		println!("Usage: ./rgen <path to content>");
+		println!("Usage: ./rgen <path to site files>");
 		return;
 	}
 	let path = Path::new(os::args().get(1).to_owned());
 	//Make sure the user gave us a directory and not a file. 
 	if !path.is_dir() {
-		println!("Error: Not a directory. Usage: ./rgen <path to content>");
+		println!("Error: Not a directory. Usage: ./rgen <path to site files>");
 		return;
 	}
 	//Create the path to each of the types of data.
@@ -19,6 +20,8 @@ fn main() {
 	let pathToInclude = Path::new(path.as_str().unwrap() + "/include/");
 	let pathToResources = Path::new(path.as_str().unwrap() + "/resources/");
 	let pathToTemplates = Path::new(path.as_str().unwrap() + "/templates/");
+	let pathToOutput = Path::new(path.as_str().unwrap() + "/output/");
+
 	//Now create vectors containing paths to each of the individual files of each type. 
 	let rawContentFiles: Vec<Path> = fs::walk_dir(&pathToContent).ok().unwrap().collect();
 	let rawIncludeFiles: Vec<Path> = fs::walk_dir(&pathToInclude).ok().unwrap().collect();
@@ -61,8 +64,8 @@ fn main() {
 		}
 	}
 
-	//Map resource names
-	let resourceNames = loadResourceNames(resourceFiles);
+	//Map resource names: (name, path)
+	let resourceNames: Vec<(~str,~str)> = loadResourceNames(resourceFiles);
 
 	//Load vars.txt into vars, a vector of string tuples. Matched with %var or {%var}.
 	let vars: Vec<(~str,~str)> = loadVars(pathToInclude);
@@ -86,17 +89,36 @@ fn main() {
 	let mut content: Vec<Page> = loadContent(contentFiles, &vars, &internalLinks, &includes);
 
 	//Process content. Make block content and page content become HTML from Markdown.
-	let processedContent: Vec<Page> = processContent(&mut content);
+	mdToHTML(&mut content);
 
-	//Generate content. Build full HTML by combining templates, blocks, and HTML content. 
-	//Then output to /html, making directory if it doesn't exist. 
-	//Copy all files from /resources to /html/resources. 
+	//Generate content. Build full HTML by combining templates, blocks, and HTML content.
+	let htmlFiles: Vec<(~str,~str)> = processContent(content, templates, resourceNames, globalCSSJS);
+
+	//Then output to /output, making directory if it doesn't exist. 
+	outputFiles(htmlFiles, pathToOutput);
+
+	//Copy all files from /resources to /output/resources. 
 }
 
-fn loadResourceNames(resourceFiles: Vec<Path>) -> Vec<~str> {
-	let mut resourceNames: Vec<~str> = Vec::new();
+fn loadResourceNames(resourceFiles: Vec<Path>) -> Vec<(~str,~str)> {
+	let mut resourceNames: Vec<(~str,~str)> = Vec::new();
 	for p in resourceFiles.iter() {
-		resourceNames.push(p.filestem_str().unwrap().to_owned());
+		let pathStr = p.as_str().unwrap();
+		let fileNameStr = p.filename_str().unwrap().to_owned();
+		let mut index = 0;
+		match pathStr.find_str("/css/") {
+			Some(i) => { index = i },
+			None => { }
+		}
+		match pathStr.find_str("/img/") {
+			Some(i) => { index = i },
+			None => { }
+		}
+		match pathStr.find_str("/js/") {
+			Some(i) => { index = i },
+			None => { }
+		}
+		resourceNames.push((fileNameStr, pathStr.slice_from(index).to_owned()));
 	}
 	return resourceNames;
 }
@@ -418,6 +440,10 @@ fn loadContent(contentFiles: Vec<Path>, vars: &Vec<(~str,~str)>, internalLinks: 
 		let mut curBlockPart = "".to_owned();
 		let mut curBlockPartContent = "".to_owned();
 		let mut myStep: ContentStep = CInConfig;
+		match curLine.trim() {
+			"config" => { },
+			_ => { println!("Error loading content. No config found for page at {}", file.as_str()) }
+		}
 		loop {
 			let nextLine = fileReader.read_line();
 			match nextLine {
@@ -527,15 +553,108 @@ fn loadContent(contentFiles: Vec<Path>, vars: &Vec<(~str,~str)>, internalLinks: 
 				}
 			}
 		}
+		pages.push(myPage);
 	}
 	return pages;
 }
 
-fn processContent(pages: &mut Vec<Page>) -> Vec<Page> {
-	//Do things here
+fn mdToHTML(pages: &mut Vec<Page>) {
+	//Turn Markdown into HTML
 
-	//Now return
-	let mut returnPages = pages.clone();
-	return returnPages;
 }
 
+/*
+struct Page {
+	path: ~str,
+	linkName: ~str,
+	title: ~str,
+	template: ~str,
+	blocks: Vec<Block>,
+	headData: Vec<~str>,
+	content: ~str
+}
+
+struct Block {
+	name: ~str,
+	content: Vec<(~str,~str)> //Vector of tuples: (variable, content)
+}
+
+struct Template {
+	name: ~str,
+	inherit: ~str,
+	headData: Vec<~str>,
+	blockTemplates: Vec<(~str,~str)>,
+	content: ~str
+}*/
+
+fn processContent(pages: Vec<Page>, templates: Vec<Template>, resourceNames: Vec<(~str,~str)>, globalCSSJS: Vec<~str>) -> Vec<(~str,~str)> {
+	let mut returnVec: Vec<(~str,~str)> = Vec::new();
+	for page in pages.iter() {
+		let pageURL = page.path.to_owned();
+		let mut pageContent = "".to_owned();
+		for template in templates.iter() {
+			if template.name.trim() == page.template.trim() {
+				pageContent = template.content.replace("{content}", page.content);
+				let headDataVec = page.headData.clone().append(template.headData.as_slice());
+				let mut headDataStr = "".to_owned();
+				for line in headDataVec.iter() {
+					headDataStr = headDataStr + "\n" + line.to_owned();
+				}
+				pageContent = pageContent.replace("<head>", "<head>" + headDataStr);
+				for blockTemplate in template.blockTemplates.iter() {
+					let (ref blockTempName, ref blockTempCont) = *blockTemplate;
+					let mut myBlocks: Vec<~str> = Vec::new();
+					for block in page.blocks.iter() {
+						if block.name == *blockTempName {
+							let mut blockContent = blockTempCont.to_owned();
+							for contentBlock in block.content.iter() {
+								let (ref a, ref b) = *contentBlock;
+								blockContent = blockContent.replace("{" + a.trim() + "}", *b);
+							}
+							myBlocks.push(blockContent);
+						}
+					}
+					let mut myBlocksStr = "".to_owned();
+					for string in myBlocks.iter() {
+						myBlocksStr = myBlocksStr + *string;
+					}
+					pageContent = pageContent.replace("{" + blockTempName.trim() + "}", myBlocksStr);
+				}
+			}
+		}
+		let mut globalCSSJSStr = "".to_owned();
+		for cssJsLine in globalCSSJS.iter() {
+			globalCSSJSStr = globalCSSJSStr + "\n" + *cssJsLine;
+		}
+		pageContent = pageContent.replace("<head>", "<head>\n<title>" + page.title.trim() + "</title>\n" + globalCSSJSStr);
+		//replace resource names
+		for resource in resourceNames.iter() {
+			//(~str,~str) (filename, path)
+			let (ref a, ref b) = *resource;
+			pageContent = pageContent.replace("{$" + a.trim() + "}", *b);
+		}
+		returnVec.push((pageURL, pageContent));
+	}
+	return returnVec;
+}
+
+fn outputFiles(files: Vec<(~str,~str)>, path: Path) {
+	for file in files.iter() {
+		let (ref a, ref b) = *file;
+		println!("({}, {})", *a, *b);
+		match fs::mkdir(&path, io::UserRWX) {
+			Ok(_) => { },
+			Err(_) => { }
+		}
+		let myPath = Path::new(path.as_str().unwrap() + "/" + *a);
+		let mut writer = BufferedWriter::new(File::create(&myPath));
+		match writer.write_str(*b) {
+			Ok(_) => { },
+			Err(_) => { println!("Failed to write to file {}.", path.as_str().unwrap()) }
+		}
+		match writer.flush() {
+			Ok(_) => { },
+			Err(_) => { println!("Error writing file {}.", path.as_str().unwrap()) }
+		}
+	}
+}
